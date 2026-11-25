@@ -13,9 +13,8 @@ atualizar_sistema() {
     local servico=samba-ntp-atualizacao.service
     local unidade=/etc/systemd/system/$servico
     local versao=${VERSION_CODENAME:-} proxima fase destino boot_anterior boot_atual
-    local arquivo linha suite ad realm dc papel redes auditoria plano
+    local arquivo ad realm dc papel redes auditoria plano
     local -a fontes apt_opcoes componentes
-    local conf='^deb[[:space:]]+https?://(deb\.debian\.org|security\.debian\.org|archive\.debian\.org)/debian(-security)?[[:space:]]+'
 
     [[ -d /run/systemd/system ]] || die 'A atualização requer Debian com systemd.'
     [[ $(dpkg --print-architecture) == amd64 ]] || die 'Migração testável somente em Debian amd64.'
@@ -70,14 +69,7 @@ atualizar_sistema() {
                     /^[[:space:]]/ && !/^[[:space:]]*$/ {exit 1}
                 ' "$arquivo" || die "Fonte APT fora dos repositórios Debian previstos: $arquivo."
             else
-                while IFS= read -r linha; do
-                    [[ $linha =~ ^[[:space:]]*(#|$) ]] && continue
-                    [[ $linha =~ $conf ]] || die "Fonte APT fora dos repositórios Debian previstos: $arquivo."
-                    read -r _ _ suite _ <<< "$linha"
-                    [[ $suite == "$versao" || $suite == "$versao"-updates ||
-                       $suite == "$versao"-security || $suite == "$versao"-backports ]] ||
-                       die "Suite APT inesperada em $arquivo: $suite."
-                done < "$arquivo"
+                validar_fonte_apt "$arquivo" "$versao"
             fi
         done
         printf 'Redes das estações em CIDR, separadas por espaço ou vírgula: ' >&4
@@ -218,10 +210,10 @@ UNIT
     if [[ $versao == bullseye ]]; then proxima=bookworm; else proxima=trixie; fi
     gravar_fase "$estado" "em-andamento:$proxima:$boot_atual"
     componentes=(main)
-    if grep -qsE '^[[:space:]]*deb[[:space:]].*[[:space:]]contrib([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then componentes+=(contrib); fi
-    if grep -qsE '^[[:space:]]*deb[[:space:]].*[[:space:]]non-free([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
+    if grep -qsE '^[[:space:]]*deb(-src)?[[:space:]].*[[:space:]]contrib([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then componentes+=(contrib); fi
+    if grep -qsE '^[[:space:]]*deb(-src)?[[:space:]].*[[:space:]]non-free([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
         componentes+=(non-free non-free-firmware)
-    elif grep -qsE '^[[:space:]]*deb[[:space:]].*[[:space:]]non-free-firmware([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
+    elif grep -qsE '^[[:space:]]*deb(-src)?[[:space:]].*[[:space:]]non-free-firmware([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
         componentes+=(non-free-firmware)
     fi
     if [[ $versao == bullseye ]]; then
@@ -253,6 +245,22 @@ UNIT
     fi
 }
 
+validar_fonte_apt() {
+    local arquivo=$1 versao=$2 linha suite numero=0
+    local formato='^[[:space:]]*(deb|deb-src)[[:space:]]+(\[[^]]+\][[:space:]]+)?https?://((deb|security|archive|cdn-fastly|ftp)\.debian\.org|ftp\.[[:alpha:]]{2}\.debian\.org)/debian(-security)?/?[[:space:]]+([^[:space:]#]+)([[:space:]]|$)'
+    while IFS= read -r linha || [[ -n $linha ]]; do
+        numero=$((numero + 1))
+        linha=${linha%%#*}
+        [[ $linha =~ ^[[:space:]]*$ ]] && continue
+        [[ $linha =~ $formato ]] ||
+            die "Fonte APT não reconhecida em $arquivo:$numero. Confira a linha antes de migrar."
+        suite=${BASH_REMATCH[6]}
+        [[ $suite == "$versao" || $suite == "$versao"-updates ||
+           $suite == "$versao"-security || $suite == "$versao"-backports ]] ||
+            die "Suite APT inesperada em $arquivo:$numero: $suite."
+    done < "$arquivo"
+}
+
 gravar_fase() {
     printf '%s\n' "$2" > "$1/fase.nova"
     mv -f -- "$1/fase.nova" "$1/fase"
@@ -271,9 +279,12 @@ verificar_ad() {
 }
 
 fontes_migracao() {
-    local estado=$1 release=$2 arquivo base security
+    local estado=$1 release=$2 arquivo base security tipo
     shift 2
-    local -a componentes=("$@")
+    local -a componentes=("$@") tipos=(deb)
+    if grep -qsE '^[[:space:]]*deb-src[[:space:]]' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
+        tipos+=(deb-src)
+    fi
     mkdir -p "$estado/fontes-desativadas"
     for arquivo in /etc/apt/sources.list.d/*.list; do
         [[ -f $arquivo ]] || continue
@@ -292,11 +303,13 @@ fontes_migracao() {
         security=https://deb.debian.org/debian-security
     fi
     {
-        printf 'deb %s %s %s\n' "$base" "$release" "${componentes[*]}"
-        printf 'deb %s %s-security %s\n' "$security" "$release" "${componentes[*]}"
-        if [[ $release != bullseye ]]; then
-            printf 'deb %s %s-updates %s\n' "$base" "$release" "${componentes[*]}"
-        fi
+        for tipo in "${tipos[@]}"; do
+            printf '%s %s %s %s\n' "$tipo" "$base" "$release" "${componentes[*]}"
+            printf '%s %s %s-security %s\n' "$tipo" "$security" "$release" "${componentes[*]}"
+            if [[ $release != bullseye ]]; then
+                printf '%s %s %s-updates %s\n' "$tipo" "$base" "$release" "${componentes[*]}"
+            fi
+        done
     } > /etc/apt/sources.list
 }
 
