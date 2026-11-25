@@ -109,12 +109,12 @@ atualizar_sistema() {
     }
 KRB
         trap "rm -f -- '$estado/krb5cc'" EXIT
-        KRB5_CONFIG="$estado/krb5.conf" kinit -c "FILE:$estado/krb5cc" "$ad" <&4 >&4 ||
+        KRB5_CONFIG="$estado/krb5.conf" kinit -r 1d -c "FILE:$estado/krb5cc" "$ad" <&4 >&4 ||
             die 'Falha no login Kerberos. Nenhuma migração foi iniciada.'
-        verificar_ad
         samba-tool domain backup offline --targetdir="$estado/backup"
         compgen -G "$estado/backup/samba-backup-*.tar*" >/dev/null ||
             die 'O arquivo de backup do domínio não foi encontrado. Migração cancelada.'
+        verificar_ad
         cp -a /etc/apt/sources.list.d "$estado/backup/"
         [[ ! -f /etc/apt/sources.list ]] || cp -a /etc/apt/sources.list "$estado/backup/"
         printf '%s\n' "$redes" > "$estado/redes"
@@ -147,14 +147,59 @@ UNIT
     [[ -f $estado/fase && -f $unidade ]] || die 'Não há uma atualização registrada.'
     IFS=: read -r fase destino boot_anterior < "$estado/fase"
     case "$fase" in
-        apos-reboot)
-            [[ $boot_atual != "$boot_anterior" && $destino == "$versao" ]] ||
-                die 'O reboot ou a mudança de release ainda não foi confirmada.'
+        pronto|apos-reboot|validar-release|validar-samba|ntp-apos-reboot|configurar-ntp)
+            [[ $destino == "$versao" ]] || die "A etapa $fase espera Debian $destino. Encontrado $versao."
             ;;
-        pronto) [[ $destino == "$versao" ]] || die 'O Debian mudou desde o agendamento.' ;;
         *) die "A execução anterior parou na etapa $fase ($destino). Revise o journal antes de retomar." ;;
     esac
+
+    if [[ $modo == --continuar ]]; then
+        if ! klist -s -c "FILE:$estado/krb5cc"; then
+            exec 4<>/dev/tty || die 'Abra uma sessão interativa para renovar o ticket do AD.'
+            printf 'Usuário administrador do AD [Administrator]: ' >&4
+            IFS= read -r ad <&4 || die 'Leitura do usuário interrompida.'
+            realm=$(testparm -s --parameter-name=realm 2>/dev/null)
+            ad=${ad:-Administrator}
+            [[ $ad == *@* ]] || ad="$ad@${realm^^}"
+            KRB5_CONFIG="$estado/krb5.conf" kinit -r 1d -c "FILE:$estado/krb5cc" "$ad" <&4 >&4 ||
+                die 'Falha ao renovar o ticket do AD.'
+        fi
+        if [[ ${BASH_SOURCE[0]} != "$estado/configurar.sh" ]] &&
+           ! cmp -s "${BASH_SOURCE[0]}" "$estado/configurar.sh"; then
+            install -m 0700 "${BASH_SOURCE[0]}" "$estado/configurar.sh.novo"
+            mv -f -- "$estado/configurar.sh.novo" "$estado/configurar.sh"
+        fi
+        if [[ $fase == apos-reboot || $fase == ntp-apos-reboot ]] &&
+           [[ $boot_atual == "$boot_anterior" ]]; then
+            systemctl --no-block reboot
+        else
+            systemctl start --no-block "$servico"
+        fi
+        printf 'Retomada agendada. Acompanhe com journalctl -fu %s.\n' "$servico"
+        return
+    fi
+
     trap "rm -f -- '$estado/krb5cc'" EXIT
+    if [[ -f $estado/krb5cc ]]; then
+        KRB5_CONFIG="$estado/krb5.conf" kinit -R -c "FILE:$estado/krb5cc" >/dev/null 2>&1 || true
+    fi
+    case "$fase" in
+        apos-reboot|ntp-apos-reboot)
+            [[ $boot_atual != "$boot_anterior" ]] || die 'A etapa aguarda um reboot. Use --continuar.'
+            ;;
+        validar-release)
+            verificar_ad
+            if [[ $boot_atual == "$boot_anterior" ]]; then
+                gravar_fase "$estado" "apos-reboot:$destino:$boot_atual"
+                agendar_reboot "$estado"
+                return
+            fi
+            ;;
+    esac
+    if [[ $fase == validar-samba || $fase == ntp-apos-reboot || $fase == configurar-ntp ]]; then
+        concluir_atualizacao "$estado" "$fase" "$boot_atual" "$servico" "$unidade"
+        return
+    fi
 
     if [[ $versao == trixie ]]; then
         gravar_fase "$estado" "em-andamento:trixie-backports:$boot_atual"
@@ -187,23 +232,8 @@ UNIT
         plano=$(apt-get -s -t trixie-backports install samba samba-ad-dc)
         validar_plano "$plano"
         apt-get "${apt_opcoes[@]}" -t trixie-backports install samba samba-ad-dc
-        verificar_ad
-        samba-tool gpo load --help >/dev/null 2>&1 || die 'O Samba instalado ainda não oferece gpo load.'
-        if [[ -f /run/reboot-required ]]; then
-            gravar_fase "$estado" "apos-reboot:trixie:$boot_atual"
-            trap - EXIT
-            if ! systemctl --no-block reboot; then
-                rm -f -- "$estado/krb5cc"
-                die 'O reboot não pôde ser agendado.'
-            fi
-            return
-        fi
-        /bin/bash "$estado/configurar.sh" --pos-atualizacao
-        systemctl disable "$servico"
-        rm -f -- "$unidade" "$estado/fase" "$estado/redes" "$estado/krb5.conf"
-        systemctl daemon-reload
-        printf 'Concluído. Debian %s. ' "$VERSION_ID"
-        /usr/sbin/samba --version
+        gravar_fase "$estado" "validar-samba:trixie:$boot_atual"
+        concluir_atualizacao "$estado" validar-samba "$boot_atual" "$servico" "$unidade"
         return
     fi
 
@@ -236,13 +266,37 @@ UNIT
     ) || die "O Debian ainda não reporta $proxima."
     dpkg --audit > "$estado/dpkg-audit"
     [[ ! -s $estado/dpkg-audit ]] || die 'O upgrade terminou com pendências no dpkg.'
+    gravar_fase "$estado" "validar-release:$proxima:$boot_atual"
     verificar_ad
     gravar_fase "$estado" "apos-reboot:$proxima:$boot_atual"
+    agendar_reboot "$estado"
+}
+
+agendar_reboot() {
+    local estado=$1
     trap - EXIT
     if ! systemctl --no-block reboot; then
         rm -f -- "$estado/krb5cc"
-        die 'O reboot não pôde ser agendado.'
+        die 'O reboot não pôde ser agendado. Use --continuar.'
     fi
+}
+
+concluir_atualizacao() {
+    local estado=$1 fase=$2 boot_atual=$3 servico=$4 unidade=$5
+    verificar_ad
+    samba-tool gpo load --help >/dev/null 2>&1 || die 'O Samba instalado ainda não oferece gpo load.'
+    if [[ $fase == validar-samba && -f /run/reboot-required ]]; then
+        gravar_fase "$estado" "ntp-apos-reboot:trixie:$boot_atual"
+        agendar_reboot "$estado"
+        return
+    fi
+    gravar_fase "$estado" "configurar-ntp:trixie:$boot_atual"
+    /bin/bash "$estado/configurar.sh" --pos-atualizacao
+    systemctl disable "$servico"
+    rm -f -- "$unidade" "$estado/fase" "$estado/redes" "$estado/krb5.conf"
+    systemctl daemon-reload
+    printf 'Concluído. Debian %s. ' "$VERSION_ID"
+    /usr/sbin/samba --version
 }
 
 validar_fonte_apt() {
@@ -274,8 +328,46 @@ validar_plano() {
 }
 
 verificar_ad() {
+    local saida codigo realm raiz dn
+    local -a nomes
     systemctl is-active --quiet samba-ad-dc.service || die 'O serviço samba-ad-dc não está ativo.'
-    samba-tool dbcheck --cross-ncs
+    if saida=$(samba-tool dbcheck --cross-ncs 2>&1); then
+        printf '%s\n' "$saida"
+        return
+    else
+        codigo=$?
+    fi
+    printf '%s\n' "$saida"
+    [[ $codigo == 1 ]] || die 'Falha ao executar dbcheck. Revise o journal.'
+    realm=$(testparm -s --parameter-name=realm 2>/dev/null)
+    [[ -n $realm ]] || die 'Não foi possível identificar o domínio para a correção.'
+    raiz=$(awk -F. '{for(i=1;i<=NF;i++) printf "%sDC=%s", (i==1?"":","), $i}' <<< "$realm")
+    nomes=()
+    while IFS= read -r dn; do
+        nomes+=("$dn")
+    done < <(sed -n 's/^Not resetting nTSecurityDescriptor on //p' <<< "$saida")
+    if (( ${#nomes[@]} == 0 )) ||
+       ! grep -Eq "^Checked [0-9]+ objects \(${#nomes[@]} errors?\)$" <<< "$saida"; then
+        die 'O dbcheck encontrou outros erros. Revise o journal, corrija-os e use --continuar.'
+    fi
+    # Confere todos os DNs antes de alterar qualquer objeto.
+    for dn in "${nomes[@]}"; do
+        case "${dn,,}" in
+            "cn=deleted objects,${raiz,,}" | \
+            "cn=deleted objects,cn=configuration,${raiz,,}" | \
+            "cn=deleted objects,dc=domaindnszones,${raiz,,}" | \
+            "cn=deleted objects,dc=forestdnszones,${raiz,,}") ;;
+            *) die "Objeto fora da correção automática: $dn. Revise o journal e use --continuar." ;;
+        esac
+    done
+    for dn in "${nomes[@]}"; do
+        printf 'Corrigindo o descritor padrão de %s.\n' "$dn"
+        codigo=0
+        samba-tool dbcheck "$dn" --scope=BASE --attrs=nTSecurityDescriptor \
+            --fix --quiet --yes reset_all_well_known_acls </dev/null || codigo=$?
+        (( codigo <= 1 )) || die "Falha ao corrigir $dn. Revise o journal e use --continuar."
+    done
+    samba-tool dbcheck --cross-ncs || die 'O AD ainda reporta erros de integridade. Revise o journal e use --continuar.'
 }
 
 fontes_migracao() {
@@ -337,13 +429,13 @@ PYNET
 for cmd in samba-tool testparm python3 flock; do
     command -v "$cmd" >/dev/null || die "Comando ausente: $cmd."
 done
-if [[ ${1:-} == --atualizar || ${1:-} == --retomar ]]; then
-    [[ $# -eq 1 ]] || die 'Uso: configurar-ntp-samba-ad.sh [--atualizar]'
+if [[ ${1:-} == --atualizar || ${1:-} == --retomar || ${1:-} == --continuar ]]; then
+    [[ $# -eq 1 ]] || die 'Uso: configurar-ntp-samba-ad.sh [--atualizar|--continuar]'
     atualizar_sistema "$1"
     exit
 fi
 [[ $# -eq 0 || ( $# -eq 1 && $1 == --pos-atualizacao ) ]] ||
-    die 'Uso: configurar-ntp-samba-ad.sh [--atualizar]'
+    die 'Uso: configurar-ntp-samba-ad.sh [--atualizar|--continuar]'
 samba-tool gpo load --help >/dev/null 2>&1 ||
     die 'Este Samba não tem gpo load. Use --atualizar para executar a migração validada pelo script.'
 
@@ -414,7 +506,7 @@ export KRB5_CONFIG="$workdir/krb5.conf"
 ccache="FILE:$workdir/krb5cc"
 if [[ ${1:-} == --pos-atualizacao ]]; then
     ccache="FILE:$estado/krb5cc"
-    klist -s -c "$ccache" || die 'Ticket do AD expirado. Execute o script sem --atualizar para concluir o NTP e a GPO.'
+    klist -s -c "$ccache" || die 'Ticket do AD expirado. Execute o script com --continuar para concluir o NTP e a GPO.'
 else
     printf 'Informe a senha do administrador do AD quando solicitado.\n' >&3
     kinit -c "$ccache" "$ad_user" <&3 >&3 || die 'Falha na autenticação Kerberos.'
