@@ -603,11 +603,20 @@ samba_gpo load "$gpo_guid" --content "$workdir/gpo.json"
 policy=$(samba_gpo show "$gpo_guid")
 python3 - "$workdir/gpo.json" "$policy" <<'PYVERIFY'
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     expected = json.load(source)
-settings = json.loads(sys.argv[2].split("Policies :", 1)[1].strip())
+section = re.search(r"(?m)^Policies[ \t]*:[ \t]*$", sys.argv[2])
+if section is None:
+    sys.exit("O Samba não retornou a seção de políticas. Confira samba-tool gpo show.")
+try:
+    settings = json.loads(sys.argv[2][section.end():])
+except json.JSONDecodeError as exc:
+    sys.exit(f"O Samba retornou políticas inválidas: {exc}")
+if not isinstance(settings, list):
+    sys.exit("O Samba retornou um formato inesperado para as políticas.")
 for item in expected:
     if not any(setting["class"] == item["class"]
                and setting["keyname"].lower() == item["keyname"].lower()
